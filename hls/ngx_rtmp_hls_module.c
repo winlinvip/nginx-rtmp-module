@@ -25,6 +25,7 @@ static void * ngx_rtmp_hls_create_app_conf(ngx_conf_t *cf);
 static char * ngx_rtmp_hls_merge_app_conf(ngx_conf_t *cf,
        void *parent, void *child);
 static ngx_int_t ngx_rtmp_hls_flush_audio(ngx_rtmp_session_t *s);
+static ngx_int_t ngx_rtmp_hls_ensure_directory(ngx_rtmp_session_t *s);
 
 
 #define NGX_RTMP_HLS_BUFSIZE            (1024*1024)
@@ -101,6 +102,7 @@ typedef struct {
     ngx_flag_t                          cleanup;
     ngx_array_t                        *variant;
     ngx_str_t                           base_url;
+    ngx_int_t                           granularity;
 } ngx_rtmp_hls_app_conf_t;
 
 
@@ -258,6 +260,13 @@ static ngx_command_t ngx_rtmp_hls_commands[] = {
       ngx_conf_set_str_slot,
       NGX_RTMP_APP_CONF_OFFSET,
       offsetof(ngx_rtmp_hls_app_conf_t, base_url),
+      NULL },
+
+    { ngx_string("hls_fragment_naming_granularity"),
+      NGX_RTMP_MAIN_CONF|NGX_RTMP_SRV_CONF|NGX_RTMP_APP_CONF|NGX_CONF_TAKE1,
+      ngx_conf_set_num_slot,
+      NGX_RTMP_APP_CONF_OFFSET,
+      offsetof(ngx_rtmp_hls_app_conf_t, granularity),
       NULL },
 
     ngx_null_command
@@ -741,18 +750,17 @@ ngx_rtmp_hls_get_fragment_id(ngx_rtmp_session_t *s, uint64_t ts)
 
 
 static ngx_int_t
-ngx_rtmp_hls_close_fragment(ngx_rtmp_session_t *s, ngx_int_t discont)
+ngx_rtmp_hls_close_fragment(ngx_rtmp_session_t *s)
 {
     ngx_rtmp_hls_ctx_t         *ctx;
 
     ctx = ngx_rtmp_get_module_ctx(s, ngx_rtmp_hls_module);
-    if (!ctx->opened) {
+    if (ctx == NULL || !ctx->opened) {
         return NGX_OK;
     }
 
-    ngx_log_debug2(NGX_LOG_DEBUG_RTMP, s->connection->log, 0,
-                   "hls: close fragment n=%uL, discont=%i",
-                   ctx->frag, discont);
+    ngx_log_debug1(NGX_LOG_DEBUG_RTMP, s->connection->log, 0,
+                   "hls: close fragment n=%uL", ctx->frag);
 
     ngx_close_file(ctx->file.fd);
 
@@ -771,16 +779,29 @@ static ngx_int_t
 ngx_rtmp_hls_open_fragment(ngx_rtmp_session_t *s, uint64_t ts,
     ngx_int_t discont)
 {
-    ngx_rtmp_hls_ctx_t     *ctx;
-    ngx_rtmp_hls_frag_t    *f;
-    uint64_t                id;
+    uint64_t                  id;
+    ngx_uint_t                g;
+    ngx_rtmp_hls_ctx_t       *ctx;
+    ngx_rtmp_hls_frag_t      *f;
+    ngx_rtmp_hls_app_conf_t  *hacf;
 
     ctx = ngx_rtmp_get_module_ctx(s, ngx_rtmp_hls_module);
     if (ctx->opened) {
         return NGX_OK;
     }
 
+    if (ngx_rtmp_hls_ensure_directory(s) != NGX_OK) {
+        return NGX_ERROR;
+    }
+
+    hacf = ngx_rtmp_get_module_app_conf(s, ngx_rtmp_hls_module);
+
     id = ngx_rtmp_hls_get_fragment_id(s, ts);
+
+    if (hacf->granularity) {
+        g = (ngx_uint_t) hacf->granularity;
+        id = (uint64_t) (id / g) * g;
+    }
 
     *ngx_sprintf(ctx->stream.data + ctx->stream.len, "%uL.ts", id) = 0;
 
@@ -1245,10 +1266,6 @@ ngx_rtmp_hls_publish(ngx_rtmp_session_t *s, ngx_rtmp_publish_t *v)
         ngx_rtmp_hls_restore_stream(s);
     }
 
-    if (ngx_rtmp_hls_ensure_directory(s) != NGX_OK) {
-        return NGX_ERROR;
-    }
-
 next:
     return next_publish(s, v);
 }
@@ -1269,9 +1286,9 @@ ngx_rtmp_hls_close_stream(ngx_rtmp_session_t *s, ngx_rtmp_close_stream_t *v)
     }
 
     ngx_log_debug0(NGX_LOG_DEBUG_RTMP, s->connection->log, 0,
-                   "hls: delete stream");
+                   "hls: close stream");
 
-    ngx_rtmp_hls_close_fragment(s, 1);
+    ngx_rtmp_hls_close_fragment(s);
 
 next:
     return next_close_stream(s, v);
@@ -1346,24 +1363,28 @@ ngx_rtmp_hls_update_fragment(ngx_rtmp_session_t *s, uint64_t ts,
     ngx_rtmp_hls_app_conf_t    *hacf;
     ngx_rtmp_hls_frag_t        *f;
     ngx_msec_t                  ts_frag_len;
-    ngx_int_t                   same_frag;
+    ngx_int_t                   same_frag, force,discont;
     ngx_buf_t                  *b;
+    int64_t                     d;
 
     hacf = ngx_rtmp_get_module_app_conf(s, ngx_rtmp_hls_module);
-
     ctx = ngx_rtmp_get_module_ctx(s, ngx_rtmp_hls_module);
-
     f = NULL;
+    force = 0;
+    discont = 1;
 
     if (ctx->opened) {
-
         f = ngx_rtmp_hls_get_frag(s, ctx->nfrags);
-        f->duration = (ts - ctx->frag_ts) / 90000.;
+        d = (int64_t) (ts - ctx->frag_ts);
 
-        if (f->duration * 1000 > hacf->max_fraglen) {
+        if (d > (int64_t) hacf->max_fraglen * 90 || d < -90000) {
             ngx_log_error(NGX_LOG_ERR, s->connection->log, 0,
-                          "hls: max fragment length reached");
-            boundary = 1;
+                          "hls: force fragment split: %.3f sec, ", d / 90000.);
+            force = 1;
+
+        } else {
+            f->duration = (ts - ctx->frag_ts) / 90000.;
+            discont = 0;
         }
     }
 
@@ -1391,9 +1412,9 @@ ngx_rtmp_hls_update_fragment(ngx_rtmp_session_t *s, uint64_t ts,
             break;
     }
 
-    if (boundary) {
-        ngx_rtmp_hls_close_fragment(s, 0);
-        ngx_rtmp_hls_open_fragment(s, ts, !f);
+    if (boundary || force) {
+        ngx_rtmp_hls_close_fragment(s);
+        ngx_rtmp_hls_open_fragment(s, ts, discont);
     }
 
     b = ctx->aframe;
@@ -1416,7 +1437,7 @@ ngx_rtmp_hls_flush_audio(ngx_rtmp_session_t *s)
 
     ctx = ngx_rtmp_get_module_ctx(s, ngx_rtmp_hls_module);
 
-    if (!ctx->opened) {
+    if (ctx == NULL || !ctx->opened) {
         return NGX_OK;
     }
 
@@ -1478,7 +1499,7 @@ ngx_rtmp_hls_audio(ngx_rtmp_session_t *s, ngx_rtmp_header_t *h,
     }
 
     if (codec_ctx->audio_codec_id != NGX_RTMP_AUDIO_AAC ||
-        codec_ctx->aac_header == NULL)
+        codec_ctx->aac_header == NULL || ngx_rtmp_is_codec_header(in))
     {
         return NGX_OK;
     }
@@ -1795,11 +1816,12 @@ ngx_rtmp_hls_video(ngx_rtmp_session_t *s, ngx_rtmp_header_t *h,
     /*
      * start new fragment if
      * - we have video key frame AND
-     * - we have audio buffered or have no audio at all
+     * - we have audio buffered or have no audio at all or stream is closed
      */
 
     b = ctx->aframe;
-    boundary = frame.key && (codec_ctx->aac_header == NULL || b->last > b->pos);
+    boundary = frame.key && (codec_ctx->aac_header == NULL || !ctx->opened ||
+                             (b && b->last > b->pos));
 
     ngx_rtmp_hls_update_fragment(s, frame.dts, boundary, 1);
 
@@ -1821,30 +1843,9 @@ ngx_rtmp_hls_video(ngx_rtmp_session_t *s, ngx_rtmp_header_t *h,
 }
 
 
-static void
-ngx_rtmp_hls_discontinue(ngx_rtmp_session_t *s)
-{
-    ngx_rtmp_hls_ctx_t    *ctx;
-
-    ctx = ngx_rtmp_get_module_ctx(s, ngx_rtmp_hls_module);
-
-    if (ctx == NULL || !ctx->opened) {
-        return;
-    }
-
-    ngx_log_debug0(NGX_LOG_DEBUG_RTMP, s->connection->log, 0,
-                   "hld: discontinue");
-
-    ngx_close_file(ctx->file.fd);
-    ctx->opened = 0;
-}
-
-
 static ngx_int_t
 ngx_rtmp_hls_stream_begin(ngx_rtmp_session_t *s, ngx_rtmp_stream_begin_t *v)
 {
-    ngx_rtmp_hls_discontinue(s);
-
     return next_stream_begin(s, v);
 }
 
@@ -1852,7 +1853,9 @@ ngx_rtmp_hls_stream_begin(ngx_rtmp_session_t *s, ngx_rtmp_stream_begin_t *v)
 static ngx_int_t
 ngx_rtmp_hls_stream_eof(ngx_rtmp_session_t *s, ngx_rtmp_stream_eof_t *v)
 {
-    ngx_rtmp_hls_discontinue(s);
+    ngx_rtmp_hls_flush_audio(s);
+
+    ngx_rtmp_hls_close_fragment(s);
 
     return next_stream_eof(s, v);
 }
@@ -2084,6 +2087,7 @@ ngx_rtmp_hls_create_app_conf(ngx_conf_t *cf)
     conf->max_audio_delay = NGX_CONF_UNSET_MSEC;
     conf->audio_buffer_size = NGX_CONF_UNSET_SIZE;
     conf->cleanup = NGX_CONF_UNSET;
+    conf->granularity = NGX_CONF_UNSET;
 
     return conf;
 }
@@ -2117,6 +2121,7 @@ ngx_rtmp_hls_merge_app_conf(ngx_conf_t *cf, void *parent, void *child)
                               NGX_RTMP_HLS_BUFSIZE);
     ngx_conf_merge_value(conf->cleanup, prev->cleanup, 1);
     ngx_conf_merge_str_value(conf->base_url, prev->base_url, "");
+    ngx_conf_merge_value(conf->granularity, prev->granularity, 0);
 
     if (conf->fraglen) {
         conf->winfrags = conf->playlen / conf->fraglen;

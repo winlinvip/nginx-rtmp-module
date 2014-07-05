@@ -790,11 +790,29 @@ ngx_rtmp_record_node_close(ngx_rtmp_session_t *s,
     void                      **app_conf;
     ngx_int_t                   rc;
     ngx_rtmp_record_done_t      v;
+    u_char                      av;
 
     rracf = rctx->conf;
 
     if (rctx->file.fd == NGX_INVALID_FILE) {
         return NGX_AGAIN;
+    }
+
+    if (rctx->initialized) {
+        av = 0;
+
+        if (rctx->video) {
+            av |= 0x01;
+        }
+
+        if (rctx->audio) {
+            av |= 0x04;
+        }
+
+        if (ngx_write_file(&rctx->file, &av, 1, 4) == NGX_ERROR) {
+            ngx_log_error(NGX_LOG_CRIT, s->connection->log, ngx_errno,
+                          "record: %V error writing av mask", &rracf->id);
+        }
     }
 
     if (ngx_close_file(rctx->file.fd) == NGX_FILE_ERROR) {
@@ -866,7 +884,20 @@ ngx_rtmp_record_write_frame(ngx_rtmp_session_t *s,
                    "record: %V frame: mlen=%uD",
                    &rracf->id, h->mlen);
 
+    if (h->type == NGX_RTMP_MSG_VIDEO) {
+        rctx->video = 1;
+    } else {
+        rctx->audio = 1;
+    }
+
     timestamp = h->timestamp - rctx->epoch;
+
+    if ((int32_t) timestamp < 0) {
+        ngx_log_debug2(NGX_LOG_DEBUG_RTMP, s->connection->log, 0,
+                       "record: %V cut timestamp=%D", &rracf->id, timestamp);
+
+        timestamp = 0;
+    }
 
     /* write tag header */
     ph = hdr;
@@ -1058,7 +1089,7 @@ ngx_rtmp_record_node_av(ngx_rtmp_session_t *s, ngx_rtmp_record_rec_ctx_t *rctx,
     if (!rctx->initialized) {
 
         rctx->initialized = 1;
-        rctx->epoch = h->timestamp + rctx->time_shift;
+        rctx->epoch = h->timestamp - rctx->time_shift;
 
         if (rctx->file.offset == 0 &&
             ngx_rtmp_record_write_header(&rctx->file) != NGX_OK)

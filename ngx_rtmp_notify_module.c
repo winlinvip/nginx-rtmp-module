@@ -6,6 +6,7 @@
 
 #include <ngx_config.h>
 #include <ngx_core.h>
+#include <ngx_md5.h>
 #include "ngx_rtmp.h"
 #include "ngx_rtmp_cmd_module.h"
 #include "ngx_rtmp_netcall_module.h"
@@ -389,6 +390,7 @@ ngx_rtmp_notify_connect_create(ngx_rtmp_session_t *s, void *arg,
             sizeof("&tcurl=") - 1 + tc_url_len * 3 +
             sizeof("&pageurl=") - 1 + page_url_len * 3 +
             sizeof("&addr=") - 1 + addr_text->len * 3 +
+            sizeof("&epoch=") - 1 + NGX_INT32_LEN +
             1 + args_len
         );
 
@@ -426,6 +428,9 @@ ngx_rtmp_notify_connect_create(ngx_rtmp_session_t *s, void *arg,
     b->last = ngx_cpymem(b->last, (u_char*) "&addr=", sizeof("&addr=") -1);
     b->last = (u_char*) ngx_escape_uri(b->last, addr_text->data,
                                        addr_text->len, NGX_ESCAPE_ARGS);
+
+    b->last = ngx_cpymem(b->last, (u_char*) "&epoch=", sizeof("&epoch=") -1);
+    b->last = ngx_sprintf(b->last, "%uD", (uint32_t) s->epoch);
 
     b->last = ngx_cpymem(b->last, (u_char*) "&call=connect",
                          sizeof("&call=connect") - 1);
@@ -979,6 +984,22 @@ ngx_rtmp_notify_connect_handle(ngx_rtmp_session_t *s,
 }
 
 
+static void
+ngx_rtmp_notify_set_name(u_char *dst, size_t dst_len, u_char *src,
+    size_t src_len)
+{
+    u_char     result[16], *p;
+    ngx_md5_t  md5;
+
+    ngx_md5_init(&md5);
+    ngx_md5_update(&md5, src, src_len);
+    ngx_md5_final(result, &md5);
+
+    p = ngx_hex_dump(dst, result, ngx_min((dst_len - 1) / 2, 16));
+    *p = '\0';
+}
+
+
 static ngx_int_t
 ngx_rtmp_notify_publish_handle(ngx_rtmp_session_t *s,
         void *arg, ngx_chain_t *in)
@@ -1025,7 +1046,7 @@ ngx_rtmp_notify_publish_handle(ngx_rtmp_session_t *s,
 
     nacf = ngx_rtmp_get_module_app_conf(s, ngx_rtmp_notify_module);
     if (nacf->relay_redirect) {
-        *ngx_cpymem(v->name, name, rc) = 0;
+        ngx_rtmp_notify_set_name(v->name, NGX_RTMP_MAX_NAME, name, (size_t) rc);
     }
 
     ngx_log_error(NGX_LOG_ERR, s->connection->log, 0,
@@ -1104,7 +1125,7 @@ ngx_rtmp_notify_play_handle(ngx_rtmp_session_t *s,
 
     nacf = ngx_rtmp_get_module_app_conf(s, ngx_rtmp_notify_module);
     if (nacf->relay_redirect) {
-        *ngx_cpymem(v->name, name, rc) = 0;
+        ngx_rtmp_notify_set_name(v->name, NGX_RTMP_MAX_NAME, name, (size_t) rc);
     }
 
     ngx_log_error(NGX_LOG_INFO, s->connection->log, 0,
